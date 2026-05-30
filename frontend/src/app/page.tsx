@@ -61,7 +61,7 @@ const staggerItem = {
 
 const fadeTransition = {
   hidden: { opacity: 0, filter: "blur(4px)" },
-  show: { opacity: 1, filter: "blur(0px)", transition: { duration: 0.4, ease: "easeOut" } },
+  show: { opacity: 1, filter: "blur(0px)", transition: { duration: 0.4 } },
   exit: { opacity: 0, filter: "blur(4px)", transition: { duration: 0.3 } }
 };
 
