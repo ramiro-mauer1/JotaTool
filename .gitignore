@@ -1,0 +1,35 @@
+# Entornos virtuales de Python
+venv/
+env/
+__pycache__/
+*.pyc
+.Python
+
+# Variables de entorno y secretos (CRÍTICO)
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Dependencias Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Next.js
+.next/
+out/
+build/
+
+# Archivos de datos temporales
+backend/temp_storage/
+*.sqlite3
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Configuración del IDE
+.vscode/
+.idea/
+*.swp
