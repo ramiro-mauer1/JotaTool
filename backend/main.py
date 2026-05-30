@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 app = FastAPI(title="JotaTool — Batch Watermark Remover API", version="1.0.0")
 
-# CORS – allow the Next.js frontend on ports 3000, 3001, 3002
+# CORS – allow all origins for the Vercel deployment
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

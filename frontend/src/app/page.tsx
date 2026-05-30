@@ -34,7 +34,7 @@ interface BatchState {
 
 /* ────── Constants ────── */
 
-const BACKEND = ""; // Relative to Next.js API proxy
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || ""; 
 const MAX_FILES = 25;
 const ACCEPTED = ["image/png", "image/jpeg", "image/jpg"];
 
@@ -72,6 +72,7 @@ export default function Home() {
   const [files, setFiles] = useState<File[]>([]);
   const [batchId, setBatchId] = useState<string | null>(null);
   const [isSharing, setIsSharing] = useState(false);
+  const [isWakingUp, setIsWakingUp] = useState(false);
   const [batch, setBatch] = useState<BatchState>({
     status: "idle",
     current: 0,
@@ -147,9 +148,15 @@ export default function Home() {
 
     const form = new FormData();
     files.forEach((f) => form.append("files", f));
+    
+    // Render Free Tier Cold-Start Indicator (tardará ~50s la primera vez)
+    const wakeUpTimer = setTimeout(() => setIsWakingUp(true), 3000);
 
     try {
       const res = await fetch(`${BACKEND}/api/upload`, { method: "POST", body: form });
+      clearTimeout(wakeUpTimer);
+      setIsWakingUp(false);
+      
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: "Error de red." }));
         throw new Error(err.detail ?? "Error al subir.");
@@ -175,8 +182,12 @@ export default function Home() {
           if (d.status === "completed" || d.status === "failed") source.close();
         } catch { /* ignore parse errors */ }
       };
-      source.onerror = () => source.close();
+      source.onerror = () => {
+        source.close();
+      };
     } catch (err: any) {
+      clearTimeout(wakeUpTimer);
+      setIsWakingUp(false);
       setBatch((p) => ({ ...p, status: "failed", message: err.message ?? "Error inesperado." }));
     }
   };
@@ -437,6 +448,29 @@ export default function Home() {
                       </div>
                     </div>
                   )}
+
+                  {/* Cold-Start Warning */}
+                  <AnimatePresence>
+                    {isWakingUp && batch.status === "uploading" && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -10, height: 0 }}
+                        animate={{ opacity: 1, y: 0, height: "auto" }}
+                        exit={{ opacity: 0, height: 0 }}
+                        className="rounded-xl bg-gold-500/10 border border-gold-500/20 p-4 overflow-hidden"
+                      >
+                        <div className="flex gap-3">
+                          <Sparkles className="w-5 h-5 text-gold-500 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="text-[13px] font-medium text-gold-500">Iniciando servidores de IA...</p>
+                            <p className="text-[12px] text-gold-500/70 mt-1 leading-relaxed">
+                              Por ser la primera petición del día, los servidores seguros están despertando. 
+                              Esto puede tomar hasta 50 segundos. Por favor, no cierres la ventana.
+                            </p>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
 
                   {/* Actions (Mobile-First iOS Native Share) */}
                   <div className="flex gap-3 pt-2">
