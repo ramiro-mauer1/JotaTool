@@ -151,8 +151,9 @@ def _call_gemini_sync(pil_image: Image.Image) -> Optional[bytes]:
     the asyncio event loop.
     """
     prompt = (
-        "Remove the watermark, text overlays, or logos from this real estate photo cleanly, "
-        "naturally filling and inpainting the background (walls, sky, or floor) so it looks unedited."
+        "You are an expert photo retoucher. Remove all watermarks, text overlays, and logos from this image. "
+        "CRITICAL INSTRUCTION: DO NOT just blur the text. You must perfectly reconstruct and inpaint the underlying "
+        "textures (walls, sky, wood, floor, etc.) so the image looks completely natural, sharp, and untouched."
     )
 
     response = gemini_client.models.generate_content(
@@ -192,12 +193,11 @@ async def process_image_with_gemini(original_path: str, processed_path: str) -> 
                 f.write(image_bytes)
             logger.info(f"Image processed successfully with Gemini: {processed_path}")
         else:
-            logger.warning("Gemini response contained no image data. Applying OpenCV fallback.")
-            run_opencv_fallback(original_path, processed_path)
+            raise ValueError("Gemini response contained no image data.")
 
     except Exception as e:
-        logger.error(f"Gemini API error: {e}. Applying OpenCV fallback.")
-        run_opencv_fallback(original_path, processed_path)
+        logger.error(f"Gemini API error: {e}")
+        raise e
 
 
 # ===================================================================
@@ -223,7 +223,13 @@ async def background_batch_processor(batch_id: str, files_data: List[Dict[str, s
         batches[batch_id]["message"] = f"Cleaning photo {i + 1} of {total_files}..."
 
         # Process via Gemini or fallback
-        await process_image_with_gemini(original_path, processed_path)
+        try:
+            await process_image_with_gemini(original_path, processed_path)
+        except Exception as e:
+            logger.error(f"Batch {batch_id} failed on file {i+1}: {e}")
+            batches[batch_id]["status"] = "failed"
+            batches[batch_id]["message"] = f"Error en la IA: {str(e)}"
+            return
 
         # Register the processed file
         batches[batch_id]["files"].append({
