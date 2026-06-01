@@ -98,27 +98,52 @@ async def startup_event():
 # Image processing helpers
 # ===================================================================
 
-def generate_mask(img_shape) -> np.ndarray:
-    """Generates a black/white mask for common watermark areas."""
+def generate_mask(img_shape, img=None) -> np.ndarray:
+    """
+    Generates a smart black/white mask for watermarks.
+    Uses Canny edge detection and morphological dilation to trace the exact
+    pixels of text/logos in common watermark regions, avoiding destruction of the background.
+    """
     height, width = img_shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
 
-    # Region 1: bottom-right corner (common for real-estate logos)
-    cv2.rectangle(
-        mask,
-        (int(width * 0.60), int(height * 0.80)),
-        (int(width * 0.98), int(height * 0.98)),
-        255,
-        -1,
-    )
-    # Region 2: center band (diagonal or large watermark text)
-    cv2.rectangle(
-        mask,
-        (int(width * 0.15), int(height * 0.35)),
-        (int(width * 0.85), int(height * 0.65)),
-        255,
-        -1,
-    )
+    if img is not None:
+        # Convert to grayscale for edge detection
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+
+        # Restrict edge detection to common watermark ROIs
+        roi_mask = np.zeros((height, width), dtype=np.uint8)
+        
+        # Center ROI (massive width for long text like 'SarroPucheta PROPIEDADES')
+        cv2.rectangle(
+            roi_mask,
+            (int(width * 0.05), int(height * 0.35)),
+            (int(width * 0.95), int(height * 0.65)),
+            255,
+            -1,
+        )
+        
+        # Bottom-right ROI (common for square logos)
+        cv2.rectangle(
+            roi_mask,
+            (int(width * 0.60), int(height * 0.80)),
+            (int(width * 0.98), int(height * 0.98)),
+            255,
+            -1,
+        )
+
+        # Keep only edges inside ROIs
+        roi_edges = cv2.bitwise_and(edges, roi_mask)
+
+        # Dilate edges to cover the full width of letters and their anti-aliasing halos
+        kernel = np.ones((7, 7), np.uint8)
+        smart_mask = cv2.dilate(roi_edges, kernel, iterations=3)
+        return smart_mask
+
+    # Fallback to solid rectangles if no image provided (should not happen)
+    cv2.rectangle(mask, (int(width * 0.60), int(height * 0.80)), (int(width * 0.98), int(height * 0.98)), 255, -1)
+    cv2.rectangle(mask, (int(width * 0.15), int(height * 0.35)), (int(width * 0.85), int(height * 0.65)), 255, -1)
     return mask
 
 
@@ -129,7 +154,7 @@ def run_opencv_fallback(original_path: str, processed_path: str) -> None:
     if img is None:
         raise ValueError(f"Could not load image: {original_path}")
 
-    mask = generate_mask(img.shape)
+    mask = generate_mask(img.shape, img=img)
     inpainted = cv2.inpaint(img, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
     cv2.imwrite(processed_path, inpainted)
 
@@ -170,7 +195,7 @@ async def process_image_with_clipdrop(original_path: str, processed_path: str) -
         if img is None:
             raise ValueError(f"Could not load image: {original_path}")
         
-        mask = generate_mask(img.shape)
+        mask = generate_mask(img.shape, img=img)
         mask_path = original_path + "_mask.png"
         cv2.imwrite(mask_path, mask)
 
