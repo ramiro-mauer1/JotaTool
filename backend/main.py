@@ -150,7 +150,7 @@ def _call_hf_owlvit(image_bytes: bytes) -> list:
     
     payload = {
         "inputs": b64_image,
-        "parameters": {"candidate_labels": ["logo", "watermark", "icon"]}
+        "parameters": {"candidate_labels": ["logo", "watermark", "icon", "triangle", "white shape", "symbol", "faint watermark"]}
     }
     
     # Retry mechanism for HF Cold Starts
@@ -241,7 +241,7 @@ async def process_image_with_clipdrop(original_path: str, processed_path: str) -
                 
                 for item in boxes:
                     score = item.get("score", 0)
-                    if score > 0.05:  # Low threshold to catch faded logos
+                    if score > 0.01:  # Hyper-low threshold to catch very faint logos
                         box = item.get("box", {})
                         xmin, ymin, xmax, ymax = box.get("xmin"), box.get("ymin"), box.get("xmax"), box.get("ymax")
                         if None not in (xmin, ymin, xmax, ymax):
