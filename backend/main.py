@@ -106,16 +106,16 @@ def generate_mask(img_shape) -> np.ndarray:
     # Region 1: bottom-right corner (common for real-estate logos)
     cv2.rectangle(
         mask,
-        (int(width * 0.70), int(height * 0.85)),
-        (int(width * 0.98), int(height * 0.97)),
+        (int(width * 0.60), int(height * 0.80)),
+        (int(width * 0.98), int(height * 0.98)),
         255,
         -1,
     )
-    # Region 2: center band (diagonal watermark text)
+    # Region 2: center band (diagonal or large watermark text)
     cv2.rectangle(
         mask,
-        (int(width * 0.35), int(height * 0.45)),
-        (int(width * 0.65), int(height * 0.55)),
+        (int(width * 0.15), int(height * 0.35)),
+        (int(width * 0.85), int(height * 0.65)),
         255,
         -1,
     )
