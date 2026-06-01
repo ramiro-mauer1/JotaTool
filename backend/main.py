@@ -98,55 +98,6 @@ async def startup_event():
 # Image processing helpers
 # ===================================================================
 
-def generate_mask(img_shape, img=None) -> np.ndarray:
-    """
-    Generates a smart black/white mask for watermarks.
-    Uses Canny edge detection and morphological dilation to trace the exact
-    pixels of text/logos in common watermark regions, avoiding destruction of the background.
-    """
-    height, width = img_shape[:2]
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    if img is not None:
-        # Convert to grayscale for edge detection
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 100, 200)
-
-        # Restrict edge detection to common watermark ROIs
-        roi_mask = np.zeros((height, width), dtype=np.uint8)
-        
-        # Center ROI (massive width for long text like 'SarroPucheta PROPIEDADES')
-        cv2.rectangle(
-            roi_mask,
-            (int(width * 0.05), int(height * 0.35)),
-            (int(width * 0.95), int(height * 0.65)),
-            255,
-            -1,
-        )
-        
-        # Bottom-right ROI (common for square logos)
-        cv2.rectangle(
-            roi_mask,
-            (int(width * 0.60), int(height * 0.80)),
-            (int(width * 0.98), int(height * 0.98)),
-            255,
-            -1,
-        )
-
-        # Keep only edges inside ROIs
-        roi_edges = cv2.bitwise_and(edges, roi_mask)
-
-        # Dilate edges to cover the full width of letters and their anti-aliasing halos
-        kernel = np.ones((7, 7), np.uint8)
-        smart_mask = cv2.dilate(roi_edges, kernel, iterations=3)
-        return smart_mask
-
-    # Fallback to solid rectangles if no image provided (should not happen)
-    cv2.rectangle(mask, (int(width * 0.60), int(height * 0.80)), (int(width * 0.98), int(height * 0.98)), 255, -1)
-    cv2.rectangle(mask, (int(width * 0.15), int(height * 0.35)), (int(width * 0.85), int(height * 0.65)), 255, -1)
-    return mask
-
-
 def run_opencv_fallback(original_path: str, processed_path: str) -> None:
     """Local fallback: uses OpenCV inpainting (INPAINT_TELEA)."""
     logger.info(f"Applying OpenCV fallback for {original_path}")
@@ -154,20 +105,22 @@ def run_opencv_fallback(original_path: str, processed_path: str) -> None:
     if img is None:
         raise ValueError(f"Could not load image: {original_path}")
 
-    mask = generate_mask(img.shape, img=img)
+    # Generate a simple block mask for the fallback
+    height, width = img.shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.rectangle(mask, (int(width * 0.60), int(height * 0.80)), (int(width * 0.98), int(height * 0.98)), 255, -1)
+    cv2.rectangle(mask, (int(width * 0.15), int(height * 0.35)), (int(width * 0.85), int(height * 0.65)), 255, -1)
+
     inpainted = cv2.inpaint(img, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
     cv2.imwrite(processed_path, inpainted)
 
 
-def _call_clipdrop_sync(original_path: str, mask_path: str) -> bytes:
-    """Synchronous call to Clipdrop Cleanup API."""
-    with open(original_path, 'rb') as img_f, open(mask_path, 'rb') as mask_f:
+def _call_clipdrop_sync(original_path: str) -> bytes:
+    """Synchronous call to Clipdrop Remove-Text API."""
+    with open(original_path, 'rb') as img_f:
         r = requests.post(
-            'https://clipdrop-api.co/cleanup/v1',
-            files={
-                'image_file': ('image.jpg', img_f, 'image/jpeg'),
-                'mask_file': ('mask.png', mask_f, 'image/png')
-            },
+            'https://clipdrop-api.co/remove-text/v1',
+            files={'image_file': ('image.jpg', img_f, 'image/jpeg')},
             headers={'x-api-key': CLIPDROP_API_KEY}
         )
     
@@ -190,26 +143,13 @@ async def process_image_with_clipdrop(original_path: str, processed_path: str) -
         return
 
     try:
-        # Generate the mask image required by Clipdrop
-        img = cv2.imread(original_path)
-        if img is None:
-            raise ValueError(f"Could not load image: {original_path}")
-        
-        mask = generate_mask(img.shape, img=img)
-        mask_path = original_path + "_mask.png"
-        cv2.imwrite(mask_path, mask)
-
-        # Call API in executor
+        # Call Remove-Text API in executor
         loop = asyncio.get_event_loop()
-        image_bytes = await loop.run_in_executor(None, _call_clipdrop_sync, original_path, mask_path)
+        image_bytes = await loop.run_in_executor(None, _call_clipdrop_sync, original_path)
 
         with open(processed_path, "wb") as f:
             f.write(image_bytes)
-        logger.info(f"Image processed successfully with Clipdrop: {processed_path}")
-        
-        # Cleanup temp mask
-        if os.path.exists(mask_path):
-            os.remove(mask_path)
+        logger.info(f"Image processed successfully with Clipdrop Remove-Text: {processed_path}")
 
     except Exception as e:
         logger.error(f"Clipdrop API error: {e}")
