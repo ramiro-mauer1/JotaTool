@@ -155,15 +155,19 @@ def _call_hf_owlvit(image_bytes: bytes) -> list:
     
     # Retry mechanism for HF Cold Starts
     for attempt in range(3):
-        r = requests.post(API_URL, headers=headers, json=payload)
-        if r.ok:
-            return r.json()
-        elif r.status_code == 503:
-            logger.info("HF OWL-ViT model is loading. Waiting 10 seconds...")
-            time.sleep(10)
-        else:
-            logger.error(f"HF API Error: {r.text}")
-            return []
+        try:
+            r = requests.post(API_URL, headers=headers, json=payload, timeout=45)
+            if r.ok:
+                return r.json()
+            elif r.status_code == 503:
+                logger.info(f"HF OWL-ViT model is loading (503). Attempt {attempt+1}/3. Waiting 10s...")
+                time.sleep(10)
+            else:
+                logger.error(f"HF API Error {r.status_code}: {r.text}")
+                return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HF API Connection Error: {e}. Retrying...")
+            time.sleep(5)
     return []
 
 
@@ -207,36 +211,59 @@ async def process_image_with_clipdrop(original_path: str, processed_path: str) -
         logger.info(f"Pipeline Step 1: Remove-Text for {original_path}")
         textless_bytes = await loop.run_in_executor(None, _call_clipdrop_remove_text, original_path)
 
-        # 2. Detect Logo
-        logger.info(f"Pipeline Step 2: OWL-ViT Logo Detection")
-        boxes = await loop.run_in_executor(None, _call_hf_owlvit, textless_bytes)
-        
         found_valid_logo = False
-        if boxes and HF_API_TOKEN:
-            # Create a mask from bounding boxes
+        if HF_API_TOKEN:
+            # Decode original image
             img_arr = cv2.imdecode(np.frombuffer(textless_bytes, np.uint8), cv2.IMREAD_COLOR)
             height, width = img_arr.shape[:2]
-            mask = np.zeros((height, width), dtype=np.uint8)
             
-            for item in boxes:
-                score = item.get("score", 0)
-                if score > 0.05:  # Low threshold to catch faded logos
-                    box = item.get("box", {})
-                    xmin, ymin, xmax, ymax = box.get("xmin"), box.get("ymin"), box.get("xmax"), box.get("ymax")
-                    if None not in (xmin, ymin, xmax, ymax):
-                        # Expand box by 15px to cover halo
-                        pad = 15
-                        x1 = max(0, xmin - pad)
-                        y1 = max(0, ymin - pad)
-                        x2 = min(width, xmax + pad)
-                        y2 = min(height, ymax + pad)
-                        
-                        # Only mask if it's smaller than 25% of the image (prevents disastrous huge masks)
-                        box_area = (x2 - x1) * (y2 - y1)
-                        if box_area < (width * height * 0.25):
-                            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-                            found_valid_logo = True
-                            logger.info(f"Logo detected at {x1},{y1} to {x2},{y2} (Score: {score:.2f})")
+            # 1.5 Resize for Hugging Face to avoid payload limits/timeouts
+            max_dim = 800
+            if max(height, width) > max_dim:
+                scale = max_dim / max(height, width)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                resized_img = cv2.resize(img_arr, (new_width, new_height))
+            else:
+                resized_img = img_arr
+                
+            _, encoded_img = cv2.imencode('.jpg', resized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            resized_bytes = encoded_img.tobytes()
+            
+            # 2. Detect Logo with compressed image
+            logger.info(f"Pipeline Step 2: OWL-ViT Logo Detection (Payload size: {len(resized_bytes)/1024:.1f} KB)")
+            boxes = await loop.run_in_executor(None, _call_hf_owlvit, resized_bytes)
+            
+            if boxes:
+                mask = np.zeros((height, width), dtype=np.uint8)
+                scale_x = width / resized_img.shape[1]
+                scale_y = height / resized_img.shape[0]
+                
+                for item in boxes:
+                    score = item.get("score", 0)
+                    if score > 0.05:  # Low threshold to catch faded logos
+                        box = item.get("box", {})
+                        xmin, ymin, xmax, ymax = box.get("xmin"), box.get("ymin"), box.get("xmax"), box.get("ymax")
+                        if None not in (xmin, ymin, xmax, ymax):
+                            # Scale coordinates back to original resolution
+                            orig_xmin = int(xmin * scale_x)
+                            orig_ymin = int(ymin * scale_y)
+                            orig_xmax = int(xmax * scale_x)
+                            orig_ymax = int(ymax * scale_y)
+                            
+                            # Expand box by 15px to cover halo
+                            pad = 15
+                            x1 = max(0, orig_xmin - pad)
+                            y1 = max(0, orig_ymin - pad)
+                            x2 = min(width, orig_xmax + pad)
+                            y2 = min(height, orig_ymax + pad)
+                            
+                            # Only mask if it's smaller than 25% of the image
+                            box_area = (x2 - x1) * (y2 - y1)
+                            if box_area < (width * height * 0.25):
+                                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                                found_valid_logo = True
+                                logger.info(f"Logo detected at {x1},{y1} to {x2},{y2} (Score: {score:.2f})")
 
             if found_valid_logo:
                 # 3. Cleanup the logo
