@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import requests
+import base64
+import time
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,17 +57,20 @@ app.mount("/images", StaticFiles(directory=TEMP_DIR), name="images")
 batches: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
-# Clipdrop API Key
+# Clipdrop & HF API Keys
 # ---------------------------------------------------------------------------
 CLIPDROP_API_KEY = os.getenv("CLIPDROP_API_KEY")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 
 if CLIPDROP_API_KEY:
-    logger.info("Clipdrop API key found. Using Clipdrop for inpainting.")
+    logger.info("Clipdrop API key found.")
 else:
-    logger.warning(
-        "CLIPDROP_API_KEY not found in environment variables. "
-        "OpenCV fallback will be used for local processing."
-    )
+    logger.warning("CLIPDROP_API_KEY not found in environment variables.")
+
+if HF_API_TOKEN:
+    logger.info("Hugging Face API token found. OWL-ViT logo detection enabled.")
+else:
+    logger.warning("HF_API_TOKEN not found. Graphic logo removal will be skipped.")
 
 
 # ===================================================================
@@ -115,7 +120,7 @@ def run_opencv_fallback(original_path: str, processed_path: str) -> None:
     cv2.imwrite(processed_path, inpainted)
 
 
-def _call_clipdrop_sync(original_path: str) -> bytes:
+def _call_clipdrop_remove_text(original_path: str) -> bytes:
     """Synchronous call to Clipdrop Remove-Text API."""
     with open(original_path, 'rb') as img_f:
         r = requests.post(
@@ -134,25 +139,132 @@ def _call_clipdrop_sync(original_path: str) -> bytes:
             raise Exception(f"HTTP {r.status_code}: {r.text}")
 
 
+def _call_hf_owlvit(image_bytes: bytes) -> list:
+    """Synchronous call to Hugging Face OWL-ViT for zero-shot logo detection."""
+    if not HF_API_TOKEN:
+        return []
+        
+    API_URL = "https://api-inference.huggingface.co/models/google/owlvit-base-patch32"
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+    
+    payload = {
+        "inputs": b64_image,
+        "parameters": {"candidate_labels": ["logo", "watermark", "icon"]}
+    }
+    
+    # Retry mechanism for HF Cold Starts
+    for attempt in range(3):
+        r = requests.post(API_URL, headers=headers, json=payload)
+        if r.ok:
+            return r.json()
+        elif r.status_code == 503:
+            logger.info("HF OWL-ViT model is loading. Waiting 10 seconds...")
+            time.sleep(10)
+        else:
+            logger.error(f"HF API Error: {r.text}")
+            return []
+    return []
+
+
+def _call_clipdrop_cleanup(img_path: str, mask_path: str) -> bytes:
+    """Synchronous call to Clipdrop Cleanup API for logo removal."""
+    with open(img_path, 'rb') as img_f, open(mask_path, 'rb') as mask_f:
+        r = requests.post(
+            'https://clipdrop-api.co/cleanup/v1',
+            files={
+                'image_file': ('image.jpg', img_f, 'image/jpeg'),
+                'mask_file': ('mask.png', mask_f, 'image/png')
+            },
+            headers={'x-api-key': CLIPDROP_API_KEY}
+        )
+    
+    if r.ok:
+        return r.content
+    else:
+        try:
+            err = r.json()
+            raise Exception(f"{r.status_code} - {err.get('error', r.text)}")
+        except:
+            raise Exception(f"HTTP {r.status_code}: {r.text}")
+
+
 async def process_image_with_clipdrop(original_path: str, processed_path: str) -> None:
     """
-    Attempts watermark removal via Clipdrop Cleanup API.
+    Multi-AI Pipeline:
+    1. Clipdrop Remove-Text (Erases all text perfectly without mask)
+    2. HF OWL-ViT (Detects remaining graphic logos)
+    3. Clipdrop Cleanup (Inpaints the exact logo bounding box)
     """
     if not CLIPDROP_API_KEY:
         run_opencv_fallback(original_path, processed_path)
         return
 
     try:
-        # Call Remove-Text API in executor
         loop = asyncio.get_event_loop()
-        image_bytes = await loop.run_in_executor(None, _call_clipdrop_sync, original_path)
+        
+        # 1. Remove Text
+        logger.info(f"Pipeline Step 1: Remove-Text for {original_path}")
+        textless_bytes = await loop.run_in_executor(None, _call_clipdrop_remove_text, original_path)
 
+        # 2. Detect Logo
+        logger.info(f"Pipeline Step 2: OWL-ViT Logo Detection")
+        boxes = await loop.run_in_executor(None, _call_hf_owlvit, textless_bytes)
+        
+        found_valid_logo = False
+        if boxes and HF_API_TOKEN:
+            # Create a mask from bounding boxes
+            img_arr = cv2.imdecode(np.frombuffer(textless_bytes, np.uint8), cv2.IMREAD_COLOR)
+            height, width = img_arr.shape[:2]
+            mask = np.zeros((height, width), dtype=np.uint8)
+            
+            for item in boxes:
+                score = item.get("score", 0)
+                if score > 0.05:  # Low threshold to catch faded logos
+                    box = item.get("box", {})
+                    xmin, ymin, xmax, ymax = box.get("xmin"), box.get("ymin"), box.get("xmax"), box.get("ymax")
+                    if None not in (xmin, ymin, xmax, ymax):
+                        # Expand box by 15px to cover halo
+                        pad = 15
+                        x1 = max(0, xmin - pad)
+                        y1 = max(0, ymin - pad)
+                        x2 = min(width, xmax + pad)
+                        y2 = min(height, ymax + pad)
+                        
+                        # Only mask if it's smaller than 25% of the image (prevents disastrous huge masks)
+                        box_area = (x2 - x1) * (y2 - y1)
+                        if box_area < (width * height * 0.25):
+                            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                            found_valid_logo = True
+                            logger.info(f"Logo detected at {x1},{y1} to {x2},{y2} (Score: {score:.2f})")
+
+            if found_valid_logo:
+                # 3. Cleanup the logo
+                logger.info(f"Pipeline Step 3: Cleanup Logo")
+                temp_img = processed_path + "_temp.jpg"
+                temp_mask = processed_path + "_mask.png"
+                
+                with open(temp_img, "wb") as f:
+                    f.write(textless_bytes)
+                cv2.imwrite(temp_mask, mask)
+                
+                final_bytes = await loop.run_in_executor(None, _call_clipdrop_cleanup, temp_img, temp_mask)
+                
+                with open(processed_path, "wb") as f:
+                    f.write(final_bytes)
+                    
+                os.remove(temp_img)
+                os.remove(temp_mask)
+                logger.info(f"Pipeline completed successfully with logo removal: {processed_path}")
+                return
+
+        # If no logo was found or HF token missing, just save the textless image
         with open(processed_path, "wb") as f:
-            f.write(image_bytes)
-        logger.info(f"Image processed successfully with Clipdrop Remove-Text: {processed_path}")
+            f.write(textless_bytes)
+        logger.info(f"Pipeline completed (Text only): {processed_path}")
 
     except Exception as e:
-        logger.error(f"Clipdrop API error: {e}")
+        logger.error(f"Multi-AI Pipeline error: {e}")
         # Re-raise to fail the batch in the UI
         raise e
 
