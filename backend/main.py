@@ -19,11 +19,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# New google-genai SDK imports (replaces deprecated google-generativeai)
-# ---------------------------------------------------------------------------
-from google import genai
-from google.genai import types
+import requests
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -59,21 +55,15 @@ app.mount("/images", StaticFiles(directory=TEMP_DIR), name="images")
 batches: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
-# Gemini client (new SDK pattern)
+# Clipdrop API Key
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client = None
+CLIPDROP_API_KEY = os.getenv("CLIPDROP_API_KEY")
 
-if GEMINI_API_KEY:
-    try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info("Gemini API client initialized successfully.")
-    except Exception as exc:
-        logger.error(f"Failed to initialize Gemini client: {exc}")
-        gemini_client = None
+if CLIPDROP_API_KEY:
+    logger.info("Clipdrop API key found. Using Clipdrop for inpainting.")
 else:
     logger.warning(
-        "GEMINI_API_KEY not found in environment variables. "
+        "CLIPDROP_API_KEY not found in environment variables. "
         "OpenCV fallback will be used for local processing."
     )
 
@@ -108,19 +98,9 @@ async def startup_event():
 # Image processing helpers
 # ===================================================================
 
-def run_opencv_fallback(original_path: str, processed_path: str) -> None:
-    """
-    Local fallback: uses OpenCV inpainting (INPAINT_TELEA) on common
-    watermark regions (bottom-right corner + center band).
-    """
-    logger.info(f"Applying OpenCV fallback for {original_path}")
-    img = cv2.imread(original_path)
-    if img is None:
-        raise ValueError(f"Could not load image: {original_path}")
-
-    height, width = img.shape[:2]
-
-    # Black mask – same dimensions as the source image
+def generate_mask(img_shape) -> np.ndarray:
+    """Generates a black/white mask for common watermark areas."""
+    height, width = img_shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
 
     # Region 1: bottom-right corner (common for real-estate logos)
@@ -139,64 +119,76 @@ def run_opencv_fallback(original_path: str, processed_path: str) -> None:
         255,
         -1,
     )
+    return mask
 
+
+def run_opencv_fallback(original_path: str, processed_path: str) -> None:
+    """Local fallback: uses OpenCV inpainting (INPAINT_TELEA)."""
+    logger.info(f"Applying OpenCV fallback for {original_path}")
+    img = cv2.imread(original_path)
+    if img is None:
+        raise ValueError(f"Could not load image: {original_path}")
+
+    mask = generate_mask(img.shape)
     inpainted = cv2.inpaint(img, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
     cv2.imwrite(processed_path, inpainted)
 
 
-def _call_gemini_sync(pil_image: Image.Image) -> Optional[bytes]:
+def _call_clipdrop_sync(original_path: str, mask_path: str) -> bytes:
+    """Synchronous call to Clipdrop Cleanup API."""
+    with open(original_path, 'rb') as img_f, open(mask_path, 'rb') as mask_f:
+        r = requests.post(
+            'https://clipdrop-api.co/cleanup/v1',
+            files={
+                'image_file': ('image.jpg', img_f, 'image/jpeg'),
+                'mask_file': ('mask.png', mask_f, 'image/png')
+            },
+            headers={'x-api-key': CLIPDROP_API_KEY}
+        )
+    
+    if r.ok:
+        return r.content
+    else:
+        try:
+            err = r.json()
+            raise Exception(f"{r.status_code} - {err.get('error', r.text)}")
+        except:
+            raise Exception(f"HTTP {r.status_code}: {r.text}")
+
+
+async def process_image_with_clipdrop(original_path: str, processed_path: str) -> None:
     """
-    Synchronous helper that calls the Gemini API.
-    Intended to be run inside ``run_in_executor`` so it doesn't block
-    the asyncio event loop.
+    Attempts watermark removal via Clipdrop Cleanup API.
     """
-    prompt = (
-        "You are an expert photo retoucher. Remove all watermarks, text overlays, and logos from this image. "
-        "CRITICAL INSTRUCTION: DO NOT just blur the text. You must perfectly reconstruct and inpaint the underlying "
-        "textures (walls, sky, wood, floor, etc.) so the image looks completely natural, sharp, and untouched."
-    )
-
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=[prompt, pil_image],
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-        ),
-    )
-
-    # Walk response parts looking for image bytes
-    if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-        for part in response.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.data:
-                return part.inline_data.data
-
-    return None
-
-
-async def process_image_with_gemini(original_path: str, processed_path: str) -> None:
-    """
-    Attempts watermark removal via Gemini (gemini-2.5-flash-image).
-    Falls back to OpenCV on any failure or when no API key is set.
-    """
-    if not gemini_client:
+    if not CLIPDROP_API_KEY:
         run_opencv_fallback(original_path, processed_path)
         return
 
     try:
-        pil_image = Image.open(original_path)
+        # Generate the mask image required by Clipdrop
+        img = cv2.imread(original_path)
+        if img is None:
+            raise ValueError(f"Could not load image: {original_path}")
+        
+        mask = generate_mask(img.shape)
+        mask_path = original_path + "_mask.png"
+        cv2.imwrite(mask_path, mask)
 
+        # Call API in executor
         loop = asyncio.get_event_loop()
-        image_bytes = await loop.run_in_executor(None, _call_gemini_sync, pil_image)
+        image_bytes = await loop.run_in_executor(None, _call_clipdrop_sync, original_path, mask_path)
 
-        if image_bytes:
-            with open(processed_path, "wb") as f:
-                f.write(image_bytes)
-            logger.info(f"Image processed successfully with Gemini: {processed_path}")
-        else:
-            raise ValueError("Gemini response contained no image data.")
+        with open(processed_path, "wb") as f:
+            f.write(image_bytes)
+        logger.info(f"Image processed successfully with Clipdrop: {processed_path}")
+        
+        # Cleanup temp mask
+        if os.path.exists(mask_path):
+            os.remove(mask_path)
 
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Clipdrop API error: {e}")
+        # Re-raise to fail the batch in the UI
         raise e
 
 
@@ -222,9 +214,9 @@ async def background_batch_processor(batch_id: str, files_data: List[Dict[str, s
         batches[batch_id]["current"] = i + 1
         batches[batch_id]["message"] = f"Cleaning photo {i + 1} of {total_files}..."
 
-        # Process via Gemini or fallback
+        # Process via Clipdrop or fallback
         try:
-            await process_image_with_gemini(original_path, processed_path)
+            await process_image_with_clipdrop(original_path, processed_path)
         except Exception as e:
             logger.error(f"Batch {batch_id} failed on file {i+1}: {e}")
             batches[batch_id]["status"] = "failed"
